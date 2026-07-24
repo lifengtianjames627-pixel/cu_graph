@@ -1,57 +1,94 @@
 #!/usr/bin/env bash
-# Cu(II) d9 open-shell workflow -- SECOND-SPHERE BINDING / ACETONE SELECTIVITY
-# Engine: ORCA 6.1.1 (Linux/WSL)  -- keywords follow ORCA 6.1.1 manual
+# Cu(II) ligand-exchange thermodynamics -- ORCA 6.1.1
 #
-# Goal: find a Cu(II) host whose second sphere SELECTIVELY binds acetone over other VOCs.
-# Three hosts tuned by anion H-bond strength (BF4 < Cl < TFA):
-#   host_cl  : Cu(H2O)2Cl2          (Cl inner-sphere)
-#   host_bf4 : [Cu(H2O)6](BF4)2     (BF4- weak outer / non-coordinating)
-#   host_tfa : [Cu(H2O)6](TFA)2     (TFA- H-bonding outer sphere)
+# Hypothesis:
+#   [Cu(H2O)6]2+  : labile waters -> anions X- ENTER inner sphere (DeltaG_ex < 0)
+#   [Cu(EDTA)]2-  : chelate lock   -> X- association UNFAVORABLE / outer only
 #
-# Model: guest G ADDS into the second sphere (anion stays). Binding energy:
-#   dE_bind(G)      = E(host.G) - E(host) - E(G)                 [kcal/mol]
-#   dE_bind_BBCP(G) = E(host.G) - E(host@ghost) - E(guest@ghost) [Boys-Bernardi CP]
-# With USE_GCP=1, FINAL SINGLE POINT ENERGY already includes gCP (ORCA 6.1.1).
-# Selectivity = compare dE_bind across guests; want acetone most negative.
+# Reactions (aqueous CPCM):
+#   Aqua exchange:
+#     [Cu(H2O)6]2+ + X-  ->  [Cu(H2O)5X]+ + H2O
+#     dG_ex = G(CuH2O5X) + G(H2O) - G(CuH2O6) - G(X)
 #
-# Layout of xyz (atom ORDER matters for ghost-CP fragments):
-#   host_<h>.xyz        : Cu, inner waters, 2 anions (NO outer water)
-#   guests/<g>.xyz      : isolated guest (shared across hosts)
-#   complex_<h>_<g>.xyz : host_<h> atoms FIRST, then guest G atoms
+#   EDTA association (does X attach?):
+#     [Cu(EDTA)]2- + X-  ->  [Cu(EDTA)X]3-
+#     dG_assoc = G(CuEDTA_X) - G(CuEDTA) - G(X)
+#
+# Workflow: Opt + Freq -> ZPE + RRHO thermo -> Gibbs G(298 K)
+# Optical RQ (optional later): TD-DFT on optimized Cu species.
 #
 # Usage:
 #   bash run_workflow.sh prep
 #   bash run_workflow.sh run
 #   bash run_workflow.sh analyze
 #   FORCE=1 bash run_workflow.sh run
-# Set HOSTS=(tfa); extend to (tfa bf4 cl) when ready.
 
 set -euo pipefail
 
 # ---------------------------- USER CONFIG ------------------------------------
-CHARGE_HOST=0          # Cu2+ + 2 anions = 0 for tfa/bf4/cl salts
-CHARGE_GUEST=0         # neutral VOC guests
-MULT=2                 # Cu(II) d9 doublet. Keep 2 for all Cu-containing systems.
 FUNCTIONAL="PBE0"
 DISP="D3BJ"
-BASIS_HEAVY="def2-TZVP"   # Cu (and optionally heavy anions if you bump later)
-BASIS_LIGHT="def2-SVP"    # H C O F Cl B N S -- screening level
-GCP_LEVEL="DFT/SVP"       # ORCA 6.1.1 gCP param set matching def2-SVP (manual Table 2.50)
-USE_GCP=1                 # 1 = add !GCP(${GCP_LEVEL}) to DFT energy jobs
-USE_GHOST_CP=1            # 1 = also run Boys-Bernardi ghost-atom CP (ORCA 6.1.1 official)
+BASIS_LIGHT="def2-SVP"
+BASIS_HEAVY="def2-TZVP"   # Cu, Br, S (and Cl optional heavy)
+GCP_LEVEL="DFT/SVP"
+USE_GCP=1
+USE_CPCM=1                # REQUIRED for charged aqueous DeltaG (set 0 only for debug)
+SOLVENT="Water"
 NPROCS=8
 ORCA=orca
-GUESTS=(acetone water methanol ethyl_acetate toluene)
-HOSTS=(tfa)               # start with TFA; later: (tfa bf4 cl)
-TARGET=acetone
+TEMP_K=298.15
+
+# Species tags <-> xyz + charge + multiplicity
+# Free ligands (closed shell unless noted)
+LIGANDS=(h2o cl- br- oh- no3- scn- edta4-)
+declare -A LIG_XYZ LIG_CHG LIG_MULT
+LIG_XYZ[h2o]="ligands/h2o.xyz";     LIG_CHG[h2o]=0;   LIG_MULT[h2o]=1
+LIG_XYZ[cl-]="ligands/cl-.xyz";     LIG_CHG[cl-]=-1;  LIG_MULT[cl-]=1
+LIG_XYZ[br-]="ligands/br-.xyz";     LIG_CHG[br-]=-1;  LIG_MULT[br-]=1
+LIG_XYZ[oh-]="ligands/oh-.xyz";     LIG_CHG[oh-]=-1;  LIG_MULT[oh-]=1
+LIG_XYZ[no3-]="ligands/no3-.xyz";   LIG_CHG[no3-]=-1; LIG_MULT[no3-]=1
+LIG_XYZ[scn-]="ligands/scn-.xyz";   LIG_CHG[scn-]=-1; LIG_MULT[scn-]=1
+LIG_XYZ[edta4-]="ligands/edta4-.xyz"; LIG_CHG[edta4-]=-4; LIG_MULT[edta4-]=1
+
+# Cu complexes (all Cu(II) doublet)
+COMPLEXES=(cu_h2o6 cu_h2o5_cl cu_h2o5_br cu_h2o5_oh cu_h2o5_no3 cu_h2o5_ncs \
+           cu_edta cu_edta_cl cu_edta_br cu_edta_oh cu_edta_no3 cu_edta_ncs)
+declare -A CPLX_XYZ CPLX_CHG CPLX_MULT
+for s in "${COMPLEXES[@]}"; do
+  CPLX_XYZ[$s]="complexes/${s}.xyz"
+  CPLX_MULT[$s]=2
+done
+CPLX_CHG[cu_h2o6]=2
+CPLX_CHG[cu_h2o5_cl]=1
+CPLX_CHG[cu_h2o5_br]=1
+CPLX_CHG[cu_h2o5_oh]=1
+CPLX_CHG[cu_h2o5_no3]=1
+CPLX_CHG[cu_h2o5_ncs]=1
+CPLX_CHG[cu_edta]=-2
+CPLX_CHG[cu_edta_cl]=-3
+CPLX_CHG[cu_edta_br]=-3
+CPLX_CHG[cu_edta_oh]=-3
+CPLX_CHG[cu_edta_no3]=-3
+CPLX_CHG[cu_edta_ncs]=-3
+
+# Map anion tag -> aqua product / edta product / free ligand key
+ANIONS=(cl- br- oh- no3- ncs)
+declare -A ANION_LIG AQUA_PROD EDTA_PROD
+ANION_LIG[cl-]="cl-";   AQUA_PROD[cl-]="cu_h2o5_cl";   EDTA_PROD[cl-]="cu_edta_cl"
+ANION_LIG[br-]="br-";   AQUA_PROD[br-]="cu_h2o5_br";   EDTA_PROD[br-]="cu_edta_br"
+ANION_LIG[oh-]="oh-";   AQUA_PROD[oh-]="cu_h2o5_oh";   EDTA_PROD[oh-]="cu_edta_oh"
+ANION_LIG[no3-]="no3-"; AQUA_PROD[no3-]="cu_h2o5_no3"; EDTA_PROD[no3-]="cu_edta_no3"
+ANION_LIG[ncs]="scn-";  AQUA_PROD[ncs]="cu_h2o5_ncs";  EDTA_PROD[ncs]="cu_edta_ncs"
 
 # ---------------------------- DERIVED ----------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-mkdir -p logs
+mkdir -p logs inputs
 
 GCP_KW=""
 [ "$USE_GCP" = "1" ] && GCP_KW="GCP(${GCP_LEVEL})"
+CPCM_KW=""
+[ "$USE_CPCM" = "1" ] && CPCM_KW="CPCM(${SOLVENT})"
 
 _now()    { date '+%Y-%m-%d %H:%M:%S'; }
 _fmt_dur() { local s=$1 h m; h=$((s/3600)); s=$((s%3600)); m=$((s/60)); s=$((s%60));
@@ -59,73 +96,74 @@ _fmt_dur() { local s=$1 h m; h=$((s/3600)); s=$((s%3600)); m=$((s/60)); s=$((s%6
              elif [ "$m" -gt 0 ]; then printf '%dm %ds' "$m" "$s"
              else printf '%ds' "$s"; fi; }
 
-_job_ok()  { rg -qi 'ORCA TERMINATED NORMALLY|ORCA TERMINATED|FINAL SINGLE POINT ENERGY|The optimization converged' "$1"; }
+_job_ok()  { grep -qiE 'ORCA TERMINATED NORMALLY|ORCA TERMINATED|FINAL SINGLE POINT ENERGY|The optimization converged' "$1"; }
 is_done()  { [ -s "logs/$1.log" ] && _job_ok "logs/$1.log"; }
 
-# write * xyz ... * block from an xyz file; optional ghost_mode:
-#   none | ghost_tail (last nguest atoms become ghosts) | ghost_head (first nhost atoms become ghosts)
 _append_xyz_block() {
-  local out="$1" xyz="$2" chg="$3" mult="$4" mode="${5:-none}" nhost="${6:-0}" nguest="${7:-0}"
+  local out="$1" xyz="$2" chg="$3" mult="$4"
   {
     printf '* xyz %s %s\n' "$chg" "$mult"
-    case "$mode" in
-      ghost_tail)
-        # host real, guest ghost  -> E(host in complex basis)
-        awk -v nh="$nhost" 'NR>2 {
-          if (NR-2 <= nh) print $0;
-          else { el=$1; $1=""; printf "%s :%s\n", el, $0 }
-        }' "$xyz"
-        ;;
-      ghost_head)
-        # host ghost, guest real  -> E(guest in complex basis)
-        awk -v nh="$nhost" 'NR>2 {
-          if (NR-2 <= nh) { el=$1; $1=""; printf "%s :%s\n", el, $0 }
-          else print $0
-        }' "$xyz"
-        ;;
-      *)
-        tail -n +3 "$xyz"
-        ;;
-    esac
+    tail -n +3 "$xyz"
     printf '*\n'
   } >> "$out"
 }
 
-# =============================================================================
-#  Input generators  (ORCA 6.1.1)
-# =============================================================================
+# Heavy-element NewGTO lines depending on file contents
+_has_elem() { grep -qE "^[[:space:]]*$1([[:space:]]|$)" "$2"; }
+
+_heavy_basis_block() {
+  local xyz="$1"
+  echo '  Basis "'"${BASIS_LIGHT}"'"'
+  if _has_elem Cu "$xyz"; then
+    echo '  NewGTO Cu "'"${BASIS_HEAVY}"'" end'
+  fi
+  if _has_elem Br "$xyz"; then
+    echo '  NewGTO Br "'"${BASIS_HEAVY}"'" end'
+  fi
+  if _has_elem S "$xyz"; then
+    echo '  NewGTO S "'"${BASIS_HEAVY}"'" end'
+  fi
+  if _has_elem Cl "$xyz"; then
+    echo '  NewGTO Cl "'"${BASIS_HEAVY}"'" end'
+  fi
+}
+
+# Opt + analytic Freq -> ZPE + Gibbs (RRHO) in ORCA thermo block
 gen_optfreq() {
-  local out="$1" xyz="$2" chg="$3" mult="$4"
-  cat > "${out}.inp" <<EOF
-! ${FUNCTIONAL} ${DISP} ${GCP_KW} UKS TightOpt Freq TightSCF PModel
+  local out="$1" xyz="$2" chg="$3" mult="$4" uks_kw=""
+  [ "$mult" != "1" ] && uks_kw="UKS"
+  local basis_tmp; basis_tmp="$(_heavy_basis_block "$xyz")"
+  cat > "inputs/${out}.inp" <<EOF
+! ${FUNCTIONAL} ${DISP} ${GCP_KW} ${CPCM_KW} ${uks_kw} TightOpt Freq TightSCF PModel
 %basis
-  Cu ${BASIS_HEAVY}
-  H C O F Cl B N S ${BASIS_LIGHT}
-  end
+${basis_tmp}
+end
 %scf
   Convergence Tight
   end
 %geom
   Calc_Hess true
   end
+%freq
+  Temp ${TEMP_K}
+  end
 %pal nprocs ${NPROCS} end
 %maxcore 4000
 EOF
-  _append_xyz_block "${out}.inp" "$xyz" "$chg" "$mult"
+  _append_xyz_block "inputs/${out}.inp" "$xyz" "$chg" "$mult"
 }
 
-gen_tddft() {
+gen_tddft_opt() {
+  # Optional optical single point on OPTIMIZED geometry (after run)
   local out="$1" xyz="$2" chg="$3" mult="$4"
-  # Single-point TD-DFT on given geometry. Mixed basis via %basis (not on ! line).
-  # DoSOC false: ORCA 6.1.1 SOC from UKS reference is not supported (manual).
-  cat > "${out}.inp" <<EOF
-! ${FUNCTIONAL} ${DISP} ${GCP_KW} UKS TightSCF def2/J
+  local basis_tmp; basis_tmp="$(_heavy_basis_block "$xyz")"
+  cat > "inputs/${out}.inp" <<EOF
+! ${FUNCTIONAL} ${DISP} ${GCP_KW} ${CPCM_KW} UKS TightSCF def2/J
 %basis
-  Cu ${BASIS_HEAVY}
-  H C O F Cl B N S ${BASIS_LIGHT}
-  end
+${basis_tmp}
+end
 %tddft
-  nroots 60
+  nroots 40
   maxdim 3
   dosoc false
   end
@@ -135,46 +173,9 @@ gen_tddft() {
 %pal nprocs ${NPROCS} end
 %maxcore 4000
 EOF
-  _append_xyz_block "${out}.inp" "$xyz" "$chg" "$mult"
+  _append_xyz_block "inputs/${out}.inp" "$xyz" "$chg" "$mult"
 }
 
-# Boys-Bernardi CP (ORCA 6.1.1 official): two ghost-atom single points at complex geometry.
-# dE_BBCP = E(complex) - E(A with B ghosts) - E(B with A ghosts)
-gen_ghost_cp() {
-  local tag="$1" xyz="$2" nhost="$3" nguest="$4" chg_cplx="$5" mult_cplx="$6"
-  # A = host fragment in complex basis (guest atoms ghosted)
-  cat > "04_bbcp_${tag}_A.inp" <<EOF
-! ${FUNCTIONAL} ${DISP} ${GCP_KW} UKS TightSCF PModel
-%basis
-  Cu ${BASIS_HEAVY}
-  H C O F Cl B N S ${BASIS_LIGHT}
-  end
-%scf
-  Convergence Tight
-  end
-%pal nprocs ${NPROCS} end
-%maxcore 4000
-EOF
-  _append_xyz_block "04_bbcp_${tag}_A.inp" "$xyz" "$CHARGE_HOST" "$MULT" ghost_tail "$nhost" "$nguest"
-
-  # B = guest fragment in complex basis (host atoms ghosted); closed-shell guest
-  cat > "04_bbcp_${tag}_B.inp" <<EOF
-! ${FUNCTIONAL} ${DISP} ${GCP_KW} TightSCF PModel
-%basis
-  Cu ${BASIS_HEAVY}
-  H C O F Cl B N S ${BASIS_LIGHT}
-  end
-%scf
-  Convergence Tight
-  end
-%pal nprocs ${NPROCS} end
-%maxcore 4000
-EOF
-  _append_xyz_block "04_bbcp_${tag}_B.inp" "$xyz" "$CHARGE_GUEST" "1" ghost_head "$nhost" "$nguest"
-}
-
-# =============================================================================
-#  Runner
 # =============================================================================
 JOB_IDX=0; JOB_OK=0; JOB_FAIL=0; JOB_SKIP=0; T_START=0
 
@@ -182,173 +183,151 @@ run_job() {
   local inp="$1" name; name="$(basename "$inp" .inp)"
   if [ -z "${FORCE:-}" ] && is_done "$name"; then
     JOB_SKIP=$((JOB_SKIP+1))
-    printf '[%s] ... mission SKIP (already done): %s\n' "$(_now)" "$name"
+    printf '[%s] ... SKIP: %s\n' "$(_now)" "$name"
     return 0
   fi
   JOB_IDX=$((JOB_IDX+1))
-  printf '\n==================================================================\n'
-  printf '[%s] >>> mission %d: START  %s\n' "$(_now)" "$JOB_IDX" "$name"
-  printf '      input: %s   log: logs/%s.log\n' "$inp" "$name"
-  printf '==================================================================\n'
+  printf '\n[%s] >>> START %s\n' "$(_now)" "$name"
   local t0 t1 dt; t0=$(date +%s)
   if ${ORCA} "${inp}" > "logs/${name}.log" 2>&1; then
     t1=$(date +%s); dt=$((t1-t0))
     if _job_ok "logs/${name}.log"; then
       JOB_OK=$((JOB_OK+1))
-      printf '[%s] <<< mission %d: COMPLETED  %s | time: %s\n' "$(_now)" "$JOB_IDX" "$name" "$(_fmt_dur $dt)"
+      printf '[%s] <<< OK %s | %s\n' "$(_now)" "$name" "$(_fmt_dur $dt)"
     else
       JOB_FAIL=$((JOB_FAIL+1))
-      printf '[%s] !!! mission %d: FINISHED BUT LIKELY FAILED  %s | time: %s\n' "$(_now)" "$JOB_IDX" "$name" "$(_fmt_dur $dt)"
-      printf '      check tail logs/%s.log for SCF/opt errors\n' "$name"
+      printf '[%s] !!! FAIL %s | %s\n' "$(_now)" "$name" "$(_fmt_dur $dt)"
     fi
   else
     t1=$(date +%s); dt=$((t1-t0)); JOB_FAIL=$((JOB_FAIL+1))
-    printf '[%s] XXX mission %d: CRASHED  %s | time: %s\n' "$(_now)" "$JOB_IDX" "$name" "$(_fmt_dur $dt)"
-    printf '      ORCA exited non-zero; see logs/%s.log\n' "$name"
+    printf '[%s] XXX CRASH %s | %s\n' "$(_now)" "$name" "$(_fmt_dur $dt)"
   fi
-  printf '      totals -> run %d | ok %d | failed %d | skipped %d\n' "$JOB_IDX" "$JOB_OK" "$JOB_FAIL" "$JOB_SKIP"
 }
 
 prep_all() {
-  echo "== generating ORCA 6.1.1 inputs =="
-  echo "   USE_GCP=${USE_GCP} (${GCP_KW:-off})   USE_GHOST_CP=${USE_GHOST_CP}"
-  for h in "${HOSTS[@]}"; do
-    local hxyz="host_${h}.xyz"
-    if [ -s "$hxyz" ]; then
-      gen_optfreq "01_host_${h}_optfreq" "$hxyz" "$CHARGE_HOST" "$MULT"
-      gen_tddft    "05_host_${h}_tddft"    "$hxyz" "$CHARGE_HOST" "$MULT"
-    else
-      echo "  [skip host] $hxyz missing"
-    fi
-    for g in "${GUESTS[@]}"; do
-      local cxyz="complex_${h}_${g}.xyz"
-      if [ -s "$cxyz" ]; then
-        local ng nc nhost
-        ng=$(head -n1 "guests/${g}.xyz"); nc=$(head -n1 "$cxyz"); nhost=$((nc - ng))
-        gen_optfreq "03_complex_${h}_${g}_optfreq" "$cxyz" "$((CHARGE_HOST+CHARGE_GUEST))" "$MULT"
-        gen_tddft    "05_complex_${h}_${g}_tddft"   "$cxyz" "$((CHARGE_HOST+CHARGE_GUEST))" "$MULT"
-        if [ "$USE_GHOST_CP" = "1" ]; then
-          gen_ghost_cp "${h}_${g}" "$cxyz" "$nhost" "$ng" "$((CHARGE_HOST+CHARGE_GUEST))" "$MULT"
-        fi
-      else
-        echo "  [skip complex] $cxyz not provided (host atoms first, then ${g})"
-      fi
-    done
+  echo "== generating Opt+Freq (ZPE/Gibbs) inputs =="
+  echo "   CPCM=${USE_CPCM} (${SOLVENT})  GCP=${USE_GCP}  T=${TEMP_K} K"
+  for s in "${LIGANDS[@]}"; do
+    local xyz="${LIG_XYZ[$s]}"
+    [ -s "$xyz" ] || { echo "  missing $xyz"; continue; }
+    gen_optfreq "01_lig_${s}_optfreq" "$xyz" "${LIG_CHG[$s]}" "${LIG_MULT[$s]}"
   done
-  for g in "${GUESTS[@]}"; do
-    local gxyz="guests/${g}.xyz"
-    [ -s "$gxyz" ] || { echo "  [skip] $gxyz missing"; continue; }
-    gen_optfreq "02_guest_${g}_optfreq" "$gxyz" "$CHARGE_GUEST" "1"
+  for s in "${COMPLEXES[@]}"; do
+    local xyz="${CPLX_XYZ[$s]}"
+    [ -s "$xyz" ] || { echo "  missing $xyz"; continue; }
+    gen_optfreq "02_cplx_${s}_optfreq" "$xyz" "${CPLX_CHG[$s]}" "${CPLX_MULT[$s]}"
   done
+  echo "inputs in inputs/*.inp"
 }
 
 run_all() {
   prep_all
   echo "== executing =="
   T_START=$(date +%s)
-  printf '[%s] workflow START | hosts: %s\n' "$(_now)" "${HOSTS[*]}"
-  for g in "${GUESTS[@]}"; do
-    [ -s "02_guest_${g}_optfreq.inp" ] && run_job "02_guest_${g}_optfreq.inp"
+  for s in "${LIGANDS[@]}"; do
+    [ -s "inputs/01_lig_${s}_optfreq.inp" ] && run_job "inputs/01_lig_${s}_optfreq.inp"
   done
-  for h in "${HOSTS[@]}"; do
-    [ -s "01_host_${h}_optfreq.inp" ] && run_job "01_host_${h}_optfreq.inp"
-    for g in "${GUESTS[@]}"; do
-      [ -s "03_complex_${h}_${g}_optfreq.inp" ] && run_job "03_complex_${h}_${g}_optfreq.inp"
-      if [ "$USE_GHOST_CP" = "1" ]; then
-        [ -s "04_bbcp_${h}_${g}_A.inp" ] && run_job "04_bbcp_${h}_${g}_A.inp"
-        [ -s "04_bbcp_${h}_${g}_B.inp" ] && run_job "04_bbcp_${h}_${g}_B.inp"
-      fi
-      [ -s "05_complex_${h}_${g}_tddft.inp" ] && run_job "05_complex_${h}_${g}_tddft.inp"
-    done
-    [ -s "05_host_${h}_tddft.inp" ] && run_job "05_host_${h}_tddft.inp"
+  for s in "${COMPLEXES[@]}"; do
+    [ -s "inputs/02_cplx_${s}_optfreq.inp" ] && run_job "inputs/02_cplx_${s}_optfreq.inp"
   done
   local t_end total; t_end=$(date +%s); total=$((t_end-T_START))
-  printf '\n==================================================================\n'
-  printf '[%s] WORKFLOW FINISHED | total time: %s\n' "$(_now)" "$(_fmt_dur $total)"
-  printf '      run %d | ok %d | failed %d | skipped %d\n' "$JOB_IDX" "$JOB_OK" "$JOB_FAIL" "$JOB_SKIP"
-  [ "$JOB_FAIL" -gt 0 ] && printf '      !! %d failed -- fix then re-run (finished jobs auto-skipped)\n' "$JOB_FAIL"
-  printf '      next: bash run_workflow.sh analyze\n'
-  printf '==================================================================\n'
+  printf '\n[%s] DONE | %s | ok %d fail %d skip %d\n' \
+    "$(_now)" "$(_fmt_dur $total)" "$JOB_OK" "$JOB_FAIL" "$JOB_SKIP"
+  printf 'next: bash run_workflow.sh analyze\n'
 }
 
-# =============================================================================
-#  Analysis
-# =============================================================================
-get_scf_energy() { rg -oi 'FINAL SINGLE POINT ENERGY\s+-?[0-9.]+' "$1" | tail -n1 | rg -o '\-?[0-9.]+'; }
-has_imag()        { rg -qi 'imaginary frequency' "$1"; }
-spin_s2()         { rg -o '<S\*\*2>:\s+[0-9.]+' "$1" | tail -n1 | rg -o '[0-9.]+' || echo "NA"; }
+# --- parsers ---
+get_scf_energy() {
+  grep -oiE 'FINAL SINGLE POINT ENERGY[[:space:]]+-?[0-9.]+' "$1" | tail -n1 | grep -oE '\-?[0-9.]+'
+}
+get_gibbs() {
+  # ORCA: "Final Gibbs free energy         -xxx.xxxxxx Eh"
+  local g
+  g=$(grep -i 'Final Gibbs free energy' "$1" | tail -n1 | grep -oE '\-?[0-9]+\.[0-9]+' | tail -n1 || true)
+  if [ -z "$g" ]; then
+    g=$(grep -iE 'Gibbs free energy[[:space:]]+-?[0-9.]+' "$1" | tail -n1 | grep -oE '\-?[0-9]+\.[0-9]+' | tail -n1 || true)
+  fi
+  echo "$g"
+}
+get_zpe() {
+  grep -i 'Zero point energy' "$1" | tail -n1 | grep -oE '\-?[0-9]+\.[0-9]+' | head -n1 || true
+}
+has_imag() { grep -qiE 'imaginary mode|imaginary frequency' "$1"; }
+spin_s2()  { grep -oE '<S\*\*2>:[[:space:]]+[0-9.]+' "$1" | tail -n1 | grep -oE '[0-9.]+' || echo "NA"; }
 
 analyze() {
-  echo "================ SUMMARY (ORCA 6.1.1) ================"
-  echo "USE_GCP=${USE_GCP}  USE_GHOST_CP=${USE_GHOST_CP}  TARGET=${TARGET}"
-  printf "%-26s %-14s %-10s %-8s\n" "system" "E_hartree" "<S^2>" "imag?"
-  printf -- "----------------------------------------------------\n"
-  declare -A Eg
-  for g in "${GUESTS[@]}"; do
-    local f="logs/02_guest_${g}_optfreq.log"
+  echo "================ Cu ligand-exchange thermo (ORCA) ================"
+  echo "CPCM=${USE_CPCM}  GCP=${USE_GCP}  T=${TEMP_K} K"
+  echo
+  printf "%-22s %16s %16s %10s %8s\n" "species" "E_SCF/Eh" "G/Eh" "<S2>" "imag?"
+  printf -- "--------------------------------------------------------------------\n"
+
+  declare -A G E
+  for s in "${LIGANDS[@]}"; do
+    local f="logs/01_lig_${s}_optfreq.log"
     [ -s "$f" ] || continue
-    Eg[$g]=$(get_scf_energy "$f")
-    printf "%-26s %-14s %-10s %-8s\n" "guest_$g" "${Eg[$g]}" "$(spin_s2 "$f")" "$(has_imag "$f" && echo YES || echo no)"
+    E[$s]=$(get_scf_energy "$f"); G[$s]=$(get_gibbs "$f")
+    printf "%-22s %16s %16s %10s %8s\n" "lig_$s" "${E[$s]:-}" "${G[$s]:-}" "$(spin_s2 "$f")" "$(has_imag "$f" && echo YES || echo no)"
+  done
+  for s in "${COMPLEXES[@]}"; do
+    local f="logs/02_cplx_${s}_optfreq.log"
+    [ -s "$f" ] || continue
+    E[$s]=$(get_scf_energy "$f"); G[$s]=$(get_gibbs "$f")
+    printf "%-22s %16s %16s %10s %8s\n" "cplx_$s" "${E[$s]:-}" "${G[$s]:-}" "$(spin_s2 "$f")" "$(has_imag "$f" && echo YES || echo no)"
   done
 
-  for h in "${HOSTS[@]}"; do
-    local fh="logs/01_host_${h}_optfreq.log"
-    [ -s "$fh" ] || { echo "host_${h} log missing -- run first"; continue; }
-    local E_host; E_host=$(get_scf_energy "$fh")
-    printf "%-26s %-14s %-10s %-8s\n" "host_${h}" "$E_host" "$(spin_s2 "$fh")" "$(has_imag "$fh" && echo YES || echo no)"
-
-    # cache target binding for DD column
-    local dE_target=""
-    local fct="logs/03_complex_${h}_${TARGET}_optfreq.log"
-    if [ -s "$fct" ] && [ -n "${Eg[$TARGET]:-}" ]; then
-      local Ect; Ect=$(get_scf_energy "$fct")
-      dE_target=$(awk "BEGIN{printf \"%.6f\", ($Ect - $E_host - ${Eg[$TARGET]})*627.5095}")
+  echo
+  echo "---- Aqua inner-sphere exchange ----"
+  echo "  [Cu(H2O)6]2+ + X- -> [Cu(H2O)5X]+ + H2O"
+  echo "  dG_ex (kcal/mol) = [G(prod)+G(H2O)-G(cu_h2o6)-G(X)] * 627.5095"
+  echo "  more NEGATIVE => anion entry thermodynamically favored"
+  echo
+  printf "%-10s %12s %s\n" "X" "dG_ex" "note"
+  printf -- "----------------------------------------\n"
+  for a in "${ANIONS[@]}"; do
+    local lig="${ANION_LIG[$a]}" prod="${AQUA_PROD[$a]}"
+    if [ -z "${G[cu_h2o6]:-}" ] || [ -z "${G[$lig]:-}" ] || [ -z "${G[$prod]:-}" ] || [ -z "${G[h2o]:-}" ]; then
+      printf "%-10s %12s %s\n" "$a" "--" "missing G"
+      continue
     fi
-
-    echo; echo "---- Binding energy for host = ${h} ----"
-    echo "dE_bind     = E(complex) - E(host) - E(G)                         [kcal/mol]"
-    echo "dE_bind_BBCP= E(complex) - E(host@guest-ghosts) - E(guest@host-ghosts)"
-    echo "(more negative = binds better; DD_vs_${TARGET}>0 => ${TARGET} stronger)"
-    echo
-    printf "%-16s %12s %12s %12s %s\n" "guest" "dE_bind" "dE_BBCP" "DD_vs_${TARGET}" "note"
-    printf -- "------------------------------------------------------------------------\n"
-    for g in "${GUESTS[@]}"; do
-      local fc="logs/03_complex_${h}_${g}_optfreq.log"
-      [ -s "$fc" ] || { printf "%-16s %12s %12s %12s %s\n" "$g" "--" "--" "--" "no complex log"; continue; }
-      [ -z "${Eg[$g]:-}" ] && continue
-      local Ec dE dE_cp dd note=""
-      Ec=$(get_scf_energy "$fc")
-      dE=$(awk "BEGIN{printf \"%.3f\", ($Ec - $E_host - ${Eg[$g]})*627.5095}")
-      local fA="logs/04_bbcp_${h}_${g}_A.log" fB="logs/04_bbcp_${h}_${g}_B.log"
-      if [ -s "$fA" ] && [ -s "$fB" ]; then
-        local EA EB
-        EA=$(get_scf_energy "$fA"); EB=$(get_scf_energy "$fB")
-        if [ -n "$EA" ] && [ -n "$EB" ]; then
-          dE_cp=$(awk "BEGIN{printf \"%.3f\", ($Ec - $EA - $EB)*627.5095}")
-        else dE_cp="--"; fi
-      else dE_cp="--"; fi
-      if [ -n "$dE_target" ]; then
-        dd=$(awk "BEGIN{printf \"%+.3f\", $dE - $dE_target}")
-      else dd="--"; fi
-      [ "$g" = "$TARGET" ] && note="<-- target"
-      printf "%-16s %12s %12s %12s %s\n" "$g" "$dE" "$dE_cp" "$dd" "$note"
-    done
-
-    echo; echo "---- d-d / LMCT roots (host_${h} vs complexes, lowest 5) ----"
-    for f in "logs/05_host_${h}_tddft.log" "logs/05_complex_${h}_"*"_tddft.log"; do
-      [ -s "$f" ] || continue
-      echo "### $f"
-      rg -A2 'STATE\s+[0-9]+:' "$f" | head -n 20
-    done
+    local dg
+    dg=$(awk -v gp="${G[$prod]}" -v gw="${G[h2o]}" -v gc="${G[cu_h2o6]}" -v gx="${G[$lig]}" \
+      'BEGIN{printf "%.2f", (gp+gw-gc-gx)*627.5095}')
+    local note=""
+    awk -v d="$dg" 'BEGIN{exit !(d<0)}' && note="favored (inner entry)"
+    awk -v d="$dg" 'BEGIN{exit !(d>=0)}' && note="uphill"
+    printf "%-10s %12s %s\n" "$a" "$dg" "$note"
   done
 
-  echo; echo "---- JT geometry check ----"
-  echo "Measure 2 longest Cu-O (axial) vs 4 shorter (equatorial) in optimized .xyz files."
+  echo
+  echo "---- EDTA association (chelate protection) ----"
+  echo "  [Cu(EDTA)]2- + X- -> [Cu(EDTA)X]3-"
+  echo "  dG_assoc (kcal/mol) = [G(CuEDTA_X)-G(CuEDTA)-G(X)] * 627.5095"
+  echo "  POSITIVE / much less negative than aqua dG_ex => anions stay out"
+  echo
+  printf "%-10s %12s %s\n" "X" "dG_assoc" "note"
+  printf -- "----------------------------------------\n"
+  for a in "${ANIONS[@]}"; do
+    local lig="${ANION_LIG[$a]}" prod="${EDTA_PROD[$a]}"
+    if [ -z "${G[cu_edta]:-}" ] || [ -z "${G[$lig]:-}" ] || [ -z "${G[$prod]:-}" ]; then
+      printf "%-10s %12s %s\n" "$a" "--" "missing G"
+      continue
+    fi
+    local dg
+    dg=$(awk -v gp="${G[$prod]}" -v gc="${G[cu_edta]}" -v gx="${G[$lig]}" \
+      'BEGIN{printf "%.2f", (gp-gc-gx)*627.5095}')
+    printf "%-10s %12s\n" "$a" "$dg"
+  done
+
+  echo
+  echo "Also check optimized Cu-X distances: short covalent vs long outer-sphere."
+  echo "ZPE lines: grep -i 'Zero point energy' logs/*.log"
+  echo "Refs: refs/SOURCES.md"
 }
 
 case "${1:-run}" in
   prep)    prep_all ;;
   run|resume) run_all ;;
   analyze) analyze ;;
-  *) echo "usage: bash run_workflow.sh [prep|run|analyze]   FORCE=1 to re-run finished"; exit 1 ;;
+  *) echo "usage: bash run_workflow.sh [prep|run|analyze]  FORCE=1 to re-run"; exit 1 ;;
 esac
