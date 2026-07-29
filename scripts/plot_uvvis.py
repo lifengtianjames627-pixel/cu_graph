@@ -38,12 +38,12 @@ COMPARISONS = [
         "Hydroxide (EDTA ligand):Absorbance",
     ),
     (
-        "cyanide",
-        "Cyanide / thiocyanate",
-        "Cyanide (Water ligands):Wavelength(nm)",
-        "Cyanide (Water ligands):Absorbance",
-        "Cyanide (EDTA):Wavelength(nm)",
-        "Cyanide (EDTA):Absorbance",
+        "thiocyanate",
+        "Thiocyanate",
+        "Thiocyanate (Water ligands):Wavelength(nm)",
+        "Thiocyanate (Water ligands):Absorbance",
+        "Thiocyanate (EDTA):Wavelength(nm)",
+        "Thiocyanate (EDTA):Absorbance",
     ),
 ]
 
@@ -68,6 +68,19 @@ def main() -> None:
     ax.set_title(r"UV–vis: CuSO$_4\cdot$5H$_2$O (original)")
     style_ax(ax)
     path = OUT / "uvvis_original_cuso4.png"
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    print(f"wrote {path}")
+
+    # 1b) Cu(EDTA)SO4 from so rich2.csv (same single-trace format)
+    df2 = pd.read_csv(ROOT / "so rich2.csv")
+    wl2 = df2["Data Set 4:Wavelength(nm)"]
+    ab2 = df2["Data Set 4:Absorbance"]
+    fig, ax = plt.subplots(figsize=(6.5, 4.2), constrained_layout=True)
+    ax.plot(wl2, ab2, color="#1f4e79", lw=1.8, label=r"Cu(EDTA)SO$_4$")
+    ax.set_title(r"UV–vis: Cu(EDTA)SO$_4$")
+    style_ax(ax)
+    path = OUT / "uvvis_cu_edta_so4.png"
     fig.savefig(path, dpi=300)
     plt.close(fig)
     print(f"wrote {path}")
