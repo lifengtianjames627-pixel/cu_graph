@@ -1,1 +1,3 @@
-A small summer school visualization project. Patch graphing with matplotlib.
+# cu_patch
+
+A small summer school project on copper inner and outer coordination shell. The repo is used for patch graphing with matplotlib.
